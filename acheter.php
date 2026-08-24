@@ -243,6 +243,16 @@ return "Pullman";
 return $type;
 }
 
+// 🔒 CORRECTIF BUG #1 (suite) — Si l'appel au prestataire de paiement échoue APRÈS
+// que la place a été verrouillée (commit), on la rend disponible pour les autres
+// passagers plutôt que de la bloquer indéfiniment.
+function libererPlaceApresEchecPaiement(PDO $pdo, $id_place, $reference_billet){
+    $pdo->prepare("UPDATE places SET restant = restant + 1 WHERE id_place = ?")
+        ->execute([$id_place]);
+    $pdo->prepare("UPDATE reservations_attente SET statut = 'annulee' WHERE reference = ?")
+        ->execute([$reference_billet]);
+}
+
 /* =========================
    PLACES
 ========================= */
@@ -275,7 +285,13 @@ $pays = ($type_client === 'resident' || $type_client === 'non_resident')
         ? trim($_POST['pays'] ?? '')
         : null;
 
-$stmt = $pdo->prepare("SELECT * FROM places WHERE id_place=?");
+// 🔒 CORRECTIF BUG #1 — Verrou transactionnel pour empêcher la double attribution
+$pdo->exec("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
+$pdo->beginTransaction();
+
+try {
+
+$stmt = $pdo->prepare("SELECT * FROM places WHERE id_place=? FOR UPDATE");
 $stmt->execute([$id_place]);
 $place = $stmt->fetch();
 
@@ -283,13 +299,35 @@ if($place && $place['restant'] > 0 && $date_depart > $date_actuelle){
 
 $type_place = mapPlace($place['type_place']);
 
-// 🔒 Anti-doublon : un même passager (identifié par son CNI) ne peut pas
-// acheter plusieurs billets pour le même voyage (traversee_id).
+// 🔒 CORRECTIF BUG #2 — Validation genre/cabine côté serveur (le filtrage frontend peut être contourné)
+$type_place_norm = strtolower($type_place);
+$cabine_incompatible =
+    (strpos($type_place_norm, 'homme') !== false && $sexe !== 'M') ||
+    (strpos($type_place_norm, 'femme') !== false && $sexe !== 'F');
 
-
+if ($cabine_incompatible) {
+    $pdo->rollBack();
+    $_SESSION['error'] = "❌ Cette place (" . htmlspecialchars($type_place) . ") n'est pas compatible avec le sexe déclaré du passager.";
+    header("Location: acheter.php?id=" . $id);
+    exit;
+}
 
 if(!isset($tarifs[$type_client][$type_place][$type_passager])){
-die("❌ Tarif introuvable");
+    $pdo->rollBack();
+    die("❌ Tarif introuvable");
+}
+
+// 🔒 Décrément atomique et conditionnel : si une autre transaction a pris la
+// dernière place entre-temps, "restant > 0" fait échouer la requête (0 ligne)
+// et on annule proprement au lieu de vendre deux fois la même place.
+$stmtDecrement = $pdo->prepare("UPDATE places SET restant = restant - 1 WHERE id_place = ? AND restant > 0");
+$stmtDecrement->execute([$id_place]);
+
+if ($stmtDecrement->rowCount() !== 1) {
+    $pdo->rollBack();
+    $_SESSION['error'] = "❌ Cette place vient d'être réservée par un autre passager. Merci d'en choisir une autre.";
+    header("Location: acheter.php?id=" . $id);
+    exit;
 }
 
 $prix = $tarifs[$type_client][$type_place][$type_passager];
@@ -327,6 +365,11 @@ $stmt->execute([
     $depart_client,
     $mode_paiement
 ]);
+
+// 🔒 On valide la transaction ici : la place est désormais verrouillée pour ce passager.
+// On ne garde pas le verrou pendant les appels réseau (Wave/Orange Money) qui suivent,
+// pour ne pas bloquer inutilement les autres utilisateurs pendant plusieurs secondes.
+$pdo->commit();
 
 /* =========================
    AIGUILLAGE MODE DE PAIEMENT
@@ -371,6 +414,7 @@ if ($mode_paiement === 'wave') {
 
     if ($erreurCurlWave) {
         error_log("Erreur cURL Wave : " . $erreurCurlWave);
+        libererPlaceApresEchecPaiement($pdo, $id_place, $reference_billet);
         $_SESSION['error'] = "❌ Erreur de connexion au service de paiement Wave. Veuillez réessayer.";
         header("Location: acheter.php?id=" . $id);
         exit;
@@ -425,8 +469,10 @@ $sessionWave = json_decode($reponseWave, true);
     $token_data = json_decode($response_token, true);
 
     if(!isset($token_data['access_token'])){
-        echo "<pre>";
-        print_r($token_data);
+        error_log("Erreur token Orange Money : " . $response_token);
+        libererPlaceApresEchecPaiement($pdo, $id_place, $reference_billet);
+        $_SESSION['error'] = "❌ Erreur de connexion au service de paiement Orange Money. Veuillez réessayer.";
+        header("Location: acheter.php?id=" . $id);
         exit;
     }
 
@@ -475,6 +521,7 @@ $sessionWave = json_decode($reponseWave, true);
 
     if ($response === false) {
         error_log("Erreur cURL QR Code : " . curl_error($ch));
+        libererPlaceApresEchecPaiement($pdo, $id_place, $reference_billet);
         $_SESSION['error'] = "❌ Erreur de connexion au service de paiement. Veuillez réessayer.";
         header("Location: acheter.php?id=" . $id);
         exit;
@@ -487,6 +534,7 @@ $sessionWave = json_decode($reponseWave, true);
 
     if ($http_code !== 200 || !isset($result['qrCode'])) {
         error_log("Réponse QR Code invalide (HTTP $http_code) : " . $response);
+        libererPlaceApresEchecPaiement($pdo, $id_place, $reference_billet);
         $_SESSION['error'] = "❌ Impossible de générer le QR Code de paiement. Veuillez réessayer.";
         header("Location: acheter.php?id=" . $id);
         exit;
@@ -514,13 +562,25 @@ $sessionWave = json_decode($reponseWave, true);
 
 }else if($date_depart <= $date_actuelle){
 
+$pdo->rollBack();
 $_SESSION['error'] = "❌ Ce voyage est déjà passé.";
 
 }else{
 
+$pdo->rollBack();
 $_SESSION['error'] = "❌ Plus de places disponibles";
 header("Location: acheter.php?id=".$id);
 exit;
+}
+
+} catch (Exception $e) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+    error_log("Erreur réservation : " . $e->getMessage());
+    $_SESSION['error'] = "❌ Une erreur est survenue lors de la réservation. Veuillez réessayer.";
+    header("Location: acheter.php?id=" . $id);
+    exit;
 }
 }
 ?>
@@ -809,6 +869,58 @@ box-shadow:none !important;
 .form-select:focus{
 
 border-color:var(--ocean);
+}
+
+/* 🔒 CORRECTIF BUG #4 — Bandeau frais de service visible dès le départ */
+.fee-banner{
+margin-top:10px;
+background:rgba(216,183,95,.18);
+border:1px solid rgba(216,183,95,.4);
+color:#fff;
+padding:10px 14px;
+border-radius:14px;
+font-size:12.5px;
+line-height:1.4;
+}
+
+/* 🔒 CORRECTIF BUG #6 — Labels persistants + BUG #8 — messages d'erreur en ligne */
+.field-group{
+margin-bottom:15px;
+text-align:left;
+}
+
+.field-group label{
+display:block;
+font-size:12px;
+font-weight:700;
+letter-spacing:.3px;
+text-transform:uppercase;
+color:#5b7186;
+margin-bottom:6px;
+padding-left:4px;
+}
+
+.field-group .form-control,
+.field-group .form-select{
+margin-bottom:0;
+width:100%;
+}
+
+.field-group.has-error .form-control,
+.field-group.has-error .form-select{
+border-color:#e04b4b;
+}
+
+.field-error{
+display:none;
+color:#e04b4b;
+font-size:12px;
+margin-top:5px;
+padding-left:4px;
+}
+
+.field-group.has-error .field-error{
+display:block;
 }
 
 /* PLACE */
@@ -1324,6 +1436,12 @@ transform:translateY(0);
 
 </div>
 
+<!-- 🔒 CORRECTIF BUG #4 — Frais de service annoncés dès cette étape, pas seulement à la confirmation -->
+<div class="fee-banner">
+<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+Des frais de service de <strong><?= number_format($frais_service, 0, ',', ' ') ?> FCFA</strong> s'ajoutent au prix du billet.
+</div>
+
 </div>
 
 </div>
@@ -1350,109 +1468,93 @@ transform:translateY(0);
               </div>
             </div>
       <h3><div class="card-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></div> Informations passager</h3>
-<form method="POST">
+<form method="POST" novalidate>
 
 
-<select class="form-select" name="sexe" required>
-
-<option value="">
-Sexe
-</option>
-
-<option value="M">
-Homme
-</option>
-
-<option value="F">
-Femme
-</option>
-
+<!-- 🔒 CORRECTIF BUG #6 — Labels persistants (visibles même après saisie) -->
+<div class="field-group">
+<label for="f_sexe">Sexe</label>
+<select class="form-select" name="sexe" id="f_sexe" required>
+<option value="">Sélectionner…</option>
+<option value="M">Homme</option>
+<option value="F">Femme</option>
 </select>
+<span class="field-error" id="err_sexe"></span>
+</div>
 
+<div class="field-group">
+<label for="type_client">Nationalité</label>
 <select class="form-select" name="type_client" id="type_client" required>
-
-<option value="">
-Nationalité
-</option>
-
-<option value="senegalais">
-Résident
-</option>
-
-<option value="resident">
-Étranger Résident
-</option>
-
-<option value="non_resident">
-Étranger Non Résident
-</option>
-
+<option value="">Sélectionner…</option>
+<option value="senegalais">Résident</option>
+<option value="resident">Étranger Résident</option>
+<option value="non_resident">Étranger Non Résident</option>
 </select>
+<span class="field-error" id="err_type_client"></span>
+</div>
 
 <!-- 🆕 Pays de nationalité, affiché seulement si étranger -->
+<div class="field-group" id="pays_group" style="display:none;">
+<label for="pays">Pays de nationalité</label>
 <select
 class="form-select"
 name="pays"
-id="pays"
-style="display:none;">
-
-<option value="">Pays de nationalité</option>
-
+id="pays">
+<option value="">Sélectionner…</option>
 <?php foreach ($liste_pays as $p): ?>
 <option value="<?= htmlspecialchars($p) ?>"><?= htmlspecialchars($p) ?></option>
 <?php endforeach; ?>
-
 </select>
+<span class="field-error" id="err_pays"></span>
+</div>
 
-<input
-class="form-control"
-name="prenom"
-placeholder="Prénom"
-required>
+<div class="field-group">
+<label for="f_prenom">Prénom</label>
+<input class="form-control" name="prenom" id="f_prenom" required>
+<span class="field-error" id="err_prenom"></span>
+</div>
 
-<input
-class="form-control"
-name="nom"
-placeholder="Nom"
-required>
+<div class="field-group">
+<label for="f_nom">Nom</label>
+<input class="form-control" name="nom" id="f_nom" required>
+<span class="field-error" id="err_nom"></span>
+</div>
 
-<input
-class="form-control"
-name="telephone"
-placeholder="Téléphone"
-required>
+<div class="field-group">
+<label for="f_telephone">Téléphone</label>
+<input class="form-control" name="telephone" id="f_telephone" inputmode="numeric" required>
+<span class="field-error" id="err_telephone"></span>
+</div>
 
-<input
-class="form-control"
-name="cni"
-placeholder="Numéro CNI ou Passeport"
-required>
+<div class="field-group">
+<label for="f_cni">Numéro CNI ou Passeport</label>
+<input class="form-control" name="cni" id="f_cni" required>
+<span class="field-error" id="err_cni"></span>
+</div>
 
+<div class="field-group">
+<label for="f_type_passager">Type passager</label>
 <select
 class="form-select"
 name="type_passager"
+id="f_type_passager"
 required>
-
-<option value="">
-Type passager
-</option>
-
-<option value="adulte">
-Adulte
-</option>
-
-<option value="enfant">
-Enfant (4 à moins de 12 ans)
-</option>
-
+<option value="">Sélectionner…</option>
+<option value="adulte">Adulte</option>
+<option value="enfant">Enfant (4 à moins de 12 ans)</option>
 </select>
+<span class="field-error" id="err_type_passager"></span>
+</div>
 
+<div class="field-group">
+<label for="f_depart_client">Lieu de départ (optionnel)</label>
 <select
 class="form-select"
-name="depart_client">
+name="depart_client"
+id="f_depart_client">
 
 <option value="">
-Lieu de départ (optionnel)
+Sélectionner…
 </option>
 
 <option value="Carabane">
@@ -1460,6 +1562,8 @@ Carabane
 </option>
 
 </select>
+<span class="field-error" id="err_depart_client"></span>
+</div>
 
 <input
 type="hidden"
@@ -1532,100 +1636,117 @@ onclick="ouvrirPlan()">
 // 🆕 Affichage conditionnel du champ Pays selon la nationalité
 const typeClientEl = document.getElementById('type_client');
 const paysEl = document.getElementById('pays');
+const paysGroupEl = document.getElementById('pays_group');
 
 typeClientEl.addEventListener('change', function(){
 
     if(this.value === 'resident' || this.value === 'non_resident'){
-        paysEl.style.display = 'block';
+        paysGroupEl.style.display = 'block';
         paysEl.required = true;
     } else {
-        paysEl.style.display = 'none';
+        paysGroupEl.style.display = 'none';
         paysEl.required = false;
         paysEl.value = '';
     }
 
 });
 
+// 🔒 CORRECTIF BUG #8 — Retour d'erreur visible en temps réel sur chaque champ
+// (remplace l'alert() unique affiché seulement à la soumission)
+function afficherErreurChamp(fieldEl, message){
+    const group = fieldEl.closest('.field-group');
+    if(!group) return;
+    group.classList.add('has-error');
+    const errEl = group.querySelector('.field-error');
+    if(errEl) errEl.textContent = message;
+}
+
+function effacerErreurChamp(fieldEl){
+    const group = fieldEl.closest('.field-group');
+    if(!group) return;
+    group.classList.remove('has-error');
+    const errEl = group.querySelector('.field-error');
+    if(errEl) errEl.textContent = '';
+}
+
+document.querySelectorAll('#f_prenom, #f_nom, #f_telephone, #f_cni, #f_sexe, #type_client, #pays, #f_type_passager, #f_depart_client')
+.forEach(function(el){
+    el.addEventListener('blur', function(){ validerChamp(el); });
+    el.addEventListener('change', function(){ validerChamp(el); });
+});
+
+function validerChamp(el){
+    const val = el.value.trim();
+    switch(el.id){
+        case 'f_prenom':
+            val.length < 2 ? afficherErreurChamp(el, "Prénom invalide") : effacerErreurChamp(el);
+            break;
+        case 'f_nom':
+            val.length < 2 ? afficherErreurChamp(el, "Nom invalide") : effacerErreurChamp(el);
+            break;
+        case 'f_telephone':
+            !/^[0-9]{1,15}$/.test(val) ? afficherErreurChamp(el, "Numéro de téléphone invalide") : effacerErreurChamp(el);
+            break;
+        case 'f_cni':
+            val.length < 5 ? afficherErreurChamp(el, "Numéro CNI/Passeport invalide") : effacerErreurChamp(el);
+            break;
+        case 'f_sexe':
+            !val ? afficherErreurChamp(el, "Choisir le sexe") : effacerErreurChamp(el);
+            break;
+        case 'type_client':
+            !val ? afficherErreurChamp(el, "Choisir la nationalité") : effacerErreurChamp(el);
+            break;
+        case 'pays':
+            (el.required && !val) ? afficherErreurChamp(el, "Choisir le pays de nationalité") : effacerErreurChamp(el);
+            break;
+        case 'f_type_passager':
+            !val ? afficherErreurChamp(el, "Choisir le type de passager") : effacerErreurChamp(el);
+            break;
+    }
+}
+
 document.querySelector("form")
 .addEventListener("submit", function(e){
 
-let sexe =
-document.querySelector('[name="sexe"]').value;
+let sexeEl = document.getElementById('f_sexe');
+let prenomEl = document.getElementById('f_prenom');
+let nomEl = document.getElementById('f_nom');
+let telEl = document.getElementById('f_telephone');
+let cniEl = document.getElementById('f_cni');
+let clientEl = document.getElementById('type_client');
+let paysFieldEl = document.getElementById('pays');
+let typeEl = document.getElementById('f_type_passager');
+let departEl = document.getElementById('f_depart_client');
+let placeEl = document.querySelector('[name="id_place"]');
 
-let prenom =
-document.querySelector('[name="prenom"]').value.trim();
+let sexe = sexeEl.value;
+let prenom = prenomEl.value.trim();
+let nom = nomEl.value.trim();
+let tel = telEl.value.trim();
+let cni = cniEl.value.trim();
+let client = clientEl.value;
+let pays = paysFieldEl.value;
+let type = typeEl.value;
+let place = placeEl.value;
+let depart = departEl.value;
 
-let nom =
-document.querySelector('[name="nom"]').value.trim();
+[sexeEl, prenomEl, nomEl, telEl, cniEl, clientEl, paysFieldEl, typeEl]
+.forEach(validerChamp);
 
-let tel =
-document.querySelector('[name="telephone"]').value.trim();
+let hasErrors = document.querySelector('.field-group.has-error') !== null;
 
-let cni =
-document.querySelector('[name="cni"]').value.trim();
-
-let client =
-document.querySelector('[name="type_client"]').value;
-
-let pays =
-document.querySelector('[name="pays"]').value;
-
-let type =
-document.querySelector('[name="type_passager"]').value;
-
-let place =
-document.querySelector('[name="id_place"]').value;
-
-let departEl =
-document.querySelector('[name="depart_client"]');
-
-let depart =
-departEl ? departEl.value : "";
-
-let erreurs = [];
-
-if(prenom.length < 2)
-erreurs.push("Prénom invalide");
-
-if(nom.length < 2)
-erreurs.push("Nom invalide");
-
-if(!/^[0-9]{1,15}$/.test(tel)){
-
-erreurs.push("Téléphone invalide");
-
+if(!place){
+    document.getElementById('placeChoisie').closest('.place-card').style.outline = '2px solid #e04b4b';
+    hasErrors = true;
+} else if(document.getElementById('placeChoisie').closest('.place-card')){
+    document.getElementById('placeChoisie').closest('.place-card').style.outline = 'none';
 }
 
-if(cni.length < 5)
-erreurs.push("CNI invalide");
-
-if(!client)
-erreurs.push("Choisir la nationalité");
-
-// 🆕 Pays obligatoire si étranger résident/non résident
-if((client === "resident" || client === "non_resident") && !pays){
-erreurs.push("Choisir le pays de nationalité");
-}
-
-if(!sexe)
-erreurs.push("Choisir le sexe");
-
-if(!type)
-erreurs.push("Choisir type passager");
-
-if(!place)
-erreurs.push("Choisir une place");
-
-if(erreurs.length > 0){
-
-alert(
-"❌ Erreurs:\n\n" +
-erreurs.join("\n")
-);
-
-e.preventDefault();
-
-return;
+if(hasErrors){
+    e.preventDefault();
+    const premiereErreur = document.querySelector('.field-group.has-error');
+    if(premiereErreur) premiereErreur.scrollIntoView({behavior:'smooth', block:'center'});
+    return;
 }
 
 e.preventDefault();
@@ -1650,11 +1771,21 @@ document.getElementById("confirmModal").style.display = "flex";
 
 /* PLAN */
 
+// 🔒 CORRECTIF BUG #2 (front-end) — le sexe doit être choisi avant d'ouvrir le
+// plan, pour que celui-ci puisse griser les cabines incompatibles dès l'affichage.
 function ouvrirPlan(){
+
+const sexeChoisi = document.getElementById('f_sexe').value;
+
+if(!sexeChoisi){
+    afficherErreurChamp(document.getElementById('f_sexe'), "Choisir le sexe avant de sélectionner une place");
+    document.getElementById('f_sexe').scrollIntoView({behavior:'smooth', block:'center'});
+    return;
+}
 
 window.open(
 
-"plan_embarquement.php?id=<?= $id ?>",
+"plan_embarquement.php?id=<?= $id ?>&sexe=" + encodeURIComponent(sexeChoisi),
 
 "_blank",
 
@@ -1666,6 +1797,8 @@ window.open(
 
 /* RECUP PLACE */
 
+let typePlaceChoisie = ""; // 🔒 mémorisé pour revalider si le sexe change après coup
+
 window.addEventListener("message", function(e){
 
 if(e.data.id_place){
@@ -1673,12 +1806,38 @@ if(e.data.id_place){
 document.getElementById("id_place").value =
 e.data.id_place;
 
+typePlaceChoisie = e.data.type || "";
+
 document.getElementById("placeChoisie").innerHTML =
 
 "✅ Place sélectionnée : <b>" +
 e.data.numero +
 "</b>";
 
+}
+
+});
+
+// 🔒 CORRECTIF BUG #2 (front-end) — si l'utilisateur change le sexe après avoir
+// déjà choisi une place, on revérifie la compatibilité et on annule la sélection
+// si elle n'est plus valable.
+document.getElementById('f_sexe').addEventListener('change', function(){
+
+const sexe = this.value;
+const idPlaceEl = document.getElementById('id_place');
+
+if(!idPlaceEl.value || !typePlaceChoisie || !sexe) return;
+
+const t = typePlaceChoisie.toLowerCase();
+const incompatible =
+    (t.indexOf('homme') !== -1 && sexe !== 'M') ||
+    (t.indexOf('femme') !== -1 && sexe !== 'F');
+
+if(incompatible){
+    idPlaceEl.value = "";
+    typePlaceChoisie = "";
+    document.getElementById("placeChoisie").innerHTML = "Aucune place sélectionnée";
+    afficherErreurChamp(this, "La place déjà choisie n'est plus compatible avec ce sexe — merci d'en choisir une autre.");
 }
 
 });
