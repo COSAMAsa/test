@@ -16,6 +16,7 @@ error_log("SESSION ID: " . session_id() . " | PAIEMENT EXISTE: " . (isset($_SESS
 
 require_once '../config/database.php';
 require_once '../lib/phpqrcode/qrlib.php';
+require_once '../lib/finaliser_billet.php'; // 🔒 CORRECTIF : fournit marquerEchecPaiement()
 
 // 🆕 Liste des pays actifs pour le champ "Pays de nationalité"
 $stmt = $pdo->query("SELECT nom FROM pays WHERE actif = 1 ORDER BY nom ASC");
@@ -243,16 +244,6 @@ return "Pullman";
 return $type;
 }
 
-// 🔒 CORRECTIF BUG #1 (suite) — Si l'appel au prestataire de paiement échoue APRÈS
-// que la place a été verrouillée (commit), on la rend disponible pour les autres
-// passagers plutôt que de la bloquer indéfiniment.
-function libererPlaceApresEchecPaiement(PDO $pdo, $id_place, $reference_billet){
-    $pdo->prepare("UPDATE places SET restant = restant + 1 WHERE id_place = ?")
-        ->execute([$id_place]);
-    $pdo->prepare("UPDATE reservations_attente SET statut = 'annulee' WHERE reference = ?")
-        ->execute([$reference_billet]);
-}
-
 /* =========================
    PLACES
 ========================= */
@@ -317,23 +308,43 @@ if(!isset($tarifs[$type_client][$type_place][$type_passager])){
     die("❌ Tarif introuvable");
 }
 
-// 🔒 Décrément atomique et conditionnel : si une autre transaction a pris la
-// dernière place entre-temps, "restant > 0" fait échouer la requête (0 ligne)
-// et on annule proprement au lieu de vendre deux fois la même place.
-$stmtDecrement = $pdo->prepare("UPDATE places SET restant = restant - 1 WHERE id_place = ? AND restant > 0");
-$stmtDecrement->execute([$id_place]);
-
-if ($stmtDecrement->rowCount() !== 1) {
+// 🔒 CORRECTIF BUG #3 — restant ne doit plus JAMAIS être décrémenté ici.
+// Il ne doit bouger qu'une seule fois, dans finaliserBillet() (lib/finaliser_billet.php),
+// APRÈS confirmation réelle du paiement. Décrémenter dès ce stade (avant paiement)
+// bloquait des places pour des clients qui n'avaient pas encore payé, voire jamais
+// payé (abandon), et provoquait une double décrémentation au moment du paiement réel.
+if ($place['restant'] <= 0) {
     $pdo->rollBack();
-    $_SESSION['error'] = "❌ Cette place vient d'être réservée par un autre passager. Merci d'en choisir une autre.";
+    $_SESSION['error'] = "❌ Cette place n'est plus disponible. Merci d'en choisir une autre.";
+    header("Location: acheter.php?id=" . $id);
+    exit;
+}
+
+// 🔒 Anti-collision : comme restant n'est plus décrémenté ici, on verrouille aussi
+// la ligne reservations_attente pour empêcher deux clients de démarrer un paiement
+// sur la même place en même temps (le FOR UPDATE sur "places" seul ne suffit pas,
+// car son verrou est relâché dès le commit qui suit, avant même le paiement réel).
+$stmtVerifHold = $pdo->prepare("
+    SELECT COUNT(*) FROM reservations_attente
+    WHERE id_place = ?
+    AND statut IN ('attente','payee')
+    AND created_at > NOW() - INTERVAL 30 MINUTE
+    FOR UPDATE
+");
+$stmtVerifHold->execute([$id_place]);
+
+if ($stmtVerifHold->fetchColumn() > 0) {
+    $pdo->rollBack();
+    $_SESSION['error'] = "❌ Cette place est en cours de réservation par un autre passager. Merci d'en choisir une autre.";
     header("Location: acheter.php?id=" . $id);
     exit;
 }
 
 $prix = $tarifs[$type_client][$type_place][$type_passager];
-$frais_service = 500; // ⚠️ ajuste selon le vrai montant souhaité (5 semblait être un bug)
-$commission = (int) round($prix * 0.01); // 1% du prix du billet
-$total = $prix + $frais_service + $commission;
+
+$frais_service = 500;
+
+$total = $prix + $frais_service;
 
 $reference_billet = "BILLET-" . time();
 
@@ -414,7 +425,7 @@ if ($mode_paiement === 'wave') {
 
     if ($erreurCurlWave) {
         error_log("Erreur cURL Wave : " . $erreurCurlWave);
-        libererPlaceApresEchecPaiement($pdo, $id_place, $reference_billet);
+        marquerEchecPaiement($pdo, $reference_billet); // 🔒 CORRECTIF : plus besoin de +1 sur restant, jamais décrémenté à ce stade
         $_SESSION['error'] = "❌ Erreur de connexion au service de paiement Wave. Veuillez réessayer.";
         header("Location: acheter.php?id=" . $id);
         exit;
@@ -470,7 +481,7 @@ $sessionWave = json_decode($reponseWave, true);
 
     if(!isset($token_data['access_token'])){
         error_log("Erreur token Orange Money : " . $response_token);
-        libererPlaceApresEchecPaiement($pdo, $id_place, $reference_billet);
+        marquerEchecPaiement($pdo, $reference_billet); // 🔒 CORRECTIF : plus besoin de +1 sur restant, jamais décrémenté à ce stade
         $_SESSION['error'] = "❌ Erreur de connexion au service de paiement Orange Money. Veuillez réessayer.";
         header("Location: acheter.php?id=" . $id);
         exit;
@@ -521,7 +532,7 @@ $sessionWave = json_decode($reponseWave, true);
 
     if ($response === false) {
         error_log("Erreur cURL QR Code : " . curl_error($ch));
-        libererPlaceApresEchecPaiement($pdo, $id_place, $reference_billet);
+        marquerEchecPaiement($pdo, $reference_billet); // 🔒 CORRECTIF : plus besoin de +1 sur restant, jamais décrémenté à ce stade
         $_SESSION['error'] = "❌ Erreur de connexion au service de paiement. Veuillez réessayer.";
         header("Location: acheter.php?id=" . $id);
         exit;
@@ -534,7 +545,7 @@ $sessionWave = json_decode($reponseWave, true);
 
     if ($http_code !== 200 || !isset($result['qrCode'])) {
         error_log("Réponse QR Code invalide (HTTP $http_code) : " . $response);
-        libererPlaceApresEchecPaiement($pdo, $id_place, $reference_billet);
+        marquerEchecPaiement($pdo, $reference_billet); // 🔒 CORRECTIF : plus besoin de +1 sur restant, jamais décrémenté à ce stade
         $_SESSION['error'] = "❌ Impossible de générer le QR Code de paiement. Veuillez réessayer.";
         header("Location: acheter.php?id=" . $id);
         exit;
