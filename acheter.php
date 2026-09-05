@@ -69,6 +69,11 @@ $tarifs = [
 "enfant" => 13500
 ],
 
+"Cabine 2 places Mixte" => [
+"adulte" => 26500,
+"enfant" => 13500
+],
+
 "Cabine 4 places Homme" => [
 "adulte" => 24500,
 "enfant" => 12500
@@ -118,6 +123,11 @@ $tarifs = [
 "enfant" => 13900
 ],
 
+"Cabine 2 places Mixte" => [
+"adulte" => 26900,
+"enfant" => 13900
+],
+
 "Cabine 4 places Homme" => [
 "adulte" => 24900,
 "enfant" => 12900
@@ -163,6 +173,11 @@ $tarifs = [
 ],
 
 "Cabine 2 places Femme" => [
+"adulte" => 30900,
+"enfant" => 15900
+],
+
+"Cabine 2 places Mixte" => [
 "adulte" => 30900,
 "enfant" => 15900
 ],
@@ -219,6 +234,9 @@ return "Cabine 2 places Homme";
 
 if(strpos($type,'cabine 2 places femme') !== false)
 return "Cabine 2 places Femme";
+
+if(strpos($type,'cabine 2 places mixte') !== false)
+return "Cabine 2 places Mixte";
 
 if(strpos($type,'cabine 4 places homme') !== false)
 return "Cabine 4 places Homme";
