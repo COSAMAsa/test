@@ -1562,17 +1562,57 @@ id="pays">
 </div>
 
 <div class="field-group">
-<label for="f_type_passager">Type passager</label>
+<label for="f_naissance_jour">Date de naissance</label>
+<div style="display:flex; gap:8px;">
+
 <select
 class="form-select"
-name="type_passager"
-id="f_type_passager"
+name="naissance_jour"
+id="f_naissance_jour"
 required>
-<option value="">Sélectionner…</option>
-<option value="adulte">Adulte</option>
-<option value="enfant">Enfant (4 à moins de 12 ans)</option>
+<option value="">Jour</option>
+<?php for($j = 1; $j <= 31; $j++): ?>
+<option value="<?= $j ?>"><?= $j ?></option>
+<?php endfor; ?>
 </select>
-<span class="field-error" id="err_type_passager"></span>
+
+<select
+class="form-select"
+name="naissance_mois"
+id="f_naissance_mois"
+required>
+<option value="">Mois</option>
+<option value="1">Janvier</option>
+<option value="2">Février</option>
+<option value="3">Mars</option>
+<option value="4">Avril</option>
+<option value="5">Mai</option>
+<option value="6">Juin</option>
+<option value="7">Juillet</option>
+<option value="8">Août</option>
+<option value="9">Septembre</option>
+<option value="10">Octobre</option>
+<option value="11">Novembre</option>
+<option value="12">Décembre</option>
+</select>
+
+<select
+class="form-select"
+name="naissance_annee"
+id="f_naissance_annee"
+required>
+<option value="">Année</option>
+<?php $anneeActuelle = (int)date('Y'); for($a = $anneeActuelle; $a >= $anneeActuelle - 100; $a--): ?>
+<option value="<?= $a ?>"><?= $a ?></option>
+<?php endfor; ?>
+</select>
+
+</div>
+<span class="field-error" id="err_naissance"></span>
+<div id="naissance_type_calcule" style="margin-top:6px; font-size:.9em; font-weight:600;"></div>
+
+<!-- 🆕 Déduit automatiquement de la date de naissance (adulte / enfant 4 à moins de 12 ans) -->
+<input type="hidden" name="type_passager" id="f_type_passager" value="">
 </div>
 
 <div class="field-group">
@@ -1662,6 +1702,77 @@ onclick="ouvrirPlan()">
 
 <script>
 
+// 🆕 Tarifs + frais de service injectés depuis le PHP pour calcul du prix côté client
+const TARIFS = <?= json_encode($tarifs, JSON_UNESCAPED_UNICODE) ?>;
+const FRAIS_SERVICE = <?= (int)$frais_service ?>;
+
+function formatFCFA(n){
+    return new Intl.NumberFormat('fr-FR').format(n) + ' FCFA';
+}
+
+// Doit rester équivalent à mapPlace() côté PHP
+function mapPlaceJS(type){
+    type = (type || '').toLowerCase().trim();
+    if(type.indexOf('cabine 2 places homme') !== -1) return "Cabine 2 places Homme";
+    if(type.indexOf('cabine 2 places femme') !== -1) return "Cabine 2 places Femme";
+    if(type.indexOf('cabine 2 places mixte') !== -1) return "Cabine 2 places Mixte";
+    if(type.indexOf('cabine 4 places homme') !== -1) return "Cabine 4 places Homme";
+    if(type.indexOf('cabine 4 places femme') !== -1) return "Cabine 4 places Femme";
+    if(type.indexOf('cabine 4 places mixte') !== -1) return "Cabine 4 places Mixte";
+    if(type.indexOf('cabine 8 places homme') !== -1) return "Cabine 8 places Homme";
+    if(type.indexOf('cabine 8 places femme') !== -1) return "Cabine 8 places Femme";
+    if(type.indexOf('cabine 8 places mixte') !== -1) return "Cabine 8 places Mixte";
+    if(type.indexOf('pullman') !== -1) return "Pullman";
+    return type;
+}
+
+// 🆕 Valeurs du dernier calcul, réutilisées dans le modal de confirmation
+let prixBilletActuel = null;
+let totalActuel = null;
+
+// 🆕 Calcule et affiche le prix (billet + frais de service) dès qu'on a
+// assez d'informations : nationalité, type de passager et place choisie.
+function mettreAJourPrix(){
+
+    const prixDiv = document.getElementById('prix');
+    const clientEl = document.getElementById('type_client');
+    const passagerEl = document.getElementById('f_type_passager');
+
+    const client = clientEl ? clientEl.value : '';
+    const passager = passagerEl ? passagerEl.value : '';
+
+    if(!client || !passager || !typePlaceChoisie){
+        prixDiv.innerHTML = '';
+        prixBilletActuel = null;
+        totalActuel = null;
+        return;
+    }
+
+    const placeType = mapPlaceJS(typePlaceChoisie);
+    const grille = TARIFS[client] ? TARIFS[client][placeType] : null;
+
+    if(!grille || typeof grille[passager] === 'undefined'){
+        prixDiv.innerHTML = '<div class="alert alert-danger">❌ Tarif introuvable pour cette combinaison.</div>';
+        prixBilletActuel = null;
+        totalActuel = null;
+        return;
+    }
+
+    const prixBillet = grille[passager];
+    const total = prixBillet + FRAIS_SERVICE;
+
+    prixBilletActuel = prixBillet;
+    totalActuel = total;
+
+    prixDiv.innerHTML =
+        '<div class="alert alert-info">' +
+            '💰 Prix du billet : <strong>' + formatFCFA(prixBillet) + '</strong><br>' +
+            '➕ Frais de service : <strong>' + formatFCFA(FRAIS_SERVICE) + '</strong>' +
+            '<hr style="margin:8px 0;opacity:.3;border:none;border-top:1px solid rgba(0,0,0,.15);">' +
+            'Total à payer : <strong>' + formatFCFA(total) + '</strong>' +
+        '</div>';
+}
+
 // 🆕 Affichage conditionnel du champ Pays selon la nationalité
 const typeClientEl = document.getElementById('type_client');
 const paysEl = document.getElementById('pays');
@@ -1677,6 +1788,8 @@ typeClientEl.addEventListener('change', function(){
         paysEl.required = false;
         paysEl.value = '';
     }
+
+    mettreAJourPrix();
 
 });
 
@@ -1704,6 +1817,72 @@ document.querySelectorAll('#f_prenom, #f_nom, #f_telephone, #f_cni, #f_sexe, #ty
     el.addEventListener('change', function(){ validerChamp(el); });
 });
 
+// 🆕 Le type de passager (adulte/enfant) impacte directement le tarif
+document.getElementById('f_type_passager').addEventListener('change', mettreAJourPrix);
+
+// 🆕 Détermine automatiquement "adulte" ou "enfant" à partir de la date de naissance
+// (Jour / Mois / Année). Enfant = 4 ans à moins de 12 ans (4 à 11 ans révolus).
+function calculerTypePassager(){
+
+    const jourEl = document.getElementById('f_naissance_jour');
+    const moisEl = document.getElementById('f_naissance_mois');
+    const anneeEl = document.getElementById('f_naissance_annee');
+    const typeEl = document.getElementById('f_type_passager');
+    const affichageEl = document.getElementById('naissance_type_calcule');
+
+    const jour = parseInt(jourEl.value, 10);
+    const mois = parseInt(moisEl.value, 10);
+    const annee = parseInt(anneeEl.value, 10);
+
+    if(!jour || !mois || !annee){
+        typeEl.value = '';
+        affichageEl.innerHTML = '';
+        typeEl.dispatchEvent(new Event('change'));
+        return;
+    }
+
+    const dateNaissance = new Date(annee, mois - 1, jour);
+
+    // Vérifie que la date existe réellement (ex: 31 février refusé)
+    const dateValide =
+        dateNaissance.getFullYear() === annee &&
+        dateNaissance.getMonth() === mois - 1 &&
+        dateNaissance.getDate() === jour;
+
+    const aujourdhui = new Date();
+
+    if(!dateValide || dateNaissance > aujourdhui){
+        afficherErreurChamp(jourEl, "Date de naissance invalide");
+        typeEl.value = '';
+        affichageEl.innerHTML = '';
+        typeEl.dispatchEvent(new Event('change'));
+        return;
+    }
+
+    // Calcul de l'âge en années révolues
+    let age = aujourdhui.getFullYear() - dateNaissance.getFullYear();
+    const anniversairePasse =
+        (aujourdhui.getMonth() > dateNaissance.getMonth()) ||
+        (aujourdhui.getMonth() === dateNaissance.getMonth() && aujourdhui.getDate() >= dateNaissance.getDate());
+    if(!anniversairePasse) age--;
+
+    effacerErreurChamp(jourEl);
+
+    const type = (age >= 4 && age < 12) ? 'enfant' : 'adulte';
+    typeEl.value = type;
+
+    affichageEl.innerHTML = (type === 'enfant')
+        ? '👶 Type passager : <span style="color:#1BA0E2;">Enfant</span> (' + age + ' ans)'
+        : '🧑 Type passager : <span style="color:#1BA0E2;">Adulte</span> (' + age + ' ans)';
+
+    typeEl.dispatchEvent(new Event('change'));
+}
+
+[document.getElementById('f_naissance_jour'), document.getElementById('f_naissance_mois'), document.getElementById('f_naissance_annee')]
+.forEach(function(el){
+    el.addEventListener('change', calculerTypePassager);
+});
+
 function validerChamp(el){
     const val = el.value.trim();
     switch(el.id){
@@ -1729,7 +1908,7 @@ function validerChamp(el){
             (el.required && !val) ? afficherErreurChamp(el, "Choisir le pays de nationalité") : effacerErreurChamp(el);
             break;
         case 'f_type_passager':
-            !val ? afficherErreurChamp(el, "Choisir le type de passager") : effacerErreurChamp(el);
+            !val ? afficherErreurChamp(el, "Sélectionner une date de naissance complète (jour, mois, année)") : effacerErreurChamp(el);
             break;
     }
 }
@@ -1771,6 +1950,13 @@ if(!place){
     document.getElementById('placeChoisie').closest('.place-card').style.outline = 'none';
 }
 
+// 🆕 Le prix doit avoir été calculé (nationalité + type passager + place cohérents)
+mettreAJourPrix();
+if(place && (prixBilletActuel === null || totalActuel === null)){
+    document.getElementById('prix').scrollIntoView({behavior:'smooth', block:'center'});
+    hasErrors = true;
+}
+
 if(hasErrors){
     e.preventDefault();
     const premiereErreur = document.querySelector('.field-group.has-error');
@@ -1793,6 +1979,12 @@ document.querySelector("#placeChoisie").innerText;
 // 🆕 Ajout du pays dans le récap passager si présent
 document.getElementById("modalPassager").innerHTML =
 prenom + " " + nom + " · " + type + " · " + client + (pays ? " · " + pays : "");
+
+// 🆕 Récap du prix : prix du billet + frais de service + total
+document.getElementById("modalPrixBillet").innerHTML = formatFCFA(prixBilletActuel);
+document.getElementById("modalFrais").innerHTML = formatFCFA(FRAIS_SERVICE);
+document.getElementById("modalTotal").innerHTML = formatFCFA(totalActuel);
+
 // Afficher modal
 document.getElementById("confirmModal").style.display = "flex";
 
@@ -1843,6 +2035,9 @@ document.getElementById("placeChoisie").innerHTML =
 e.data.numero +
 "</b>";
 
+// 🆕 Afficher le prix (billet + frais de service) dès qu'une place est choisie
+mettreAJourPrix();
+
 }
 
 });
@@ -1867,6 +2062,7 @@ if(incompatible){
     typePlaceChoisie = "";
     document.getElementById("placeChoisie").innerHTML = "Aucune place sélectionnée";
     afficherErreurChamp(this, "La place déjà choisie n'est plus compatible avec ce sexe — merci d'en choisir une autre.");
+    mettreAJourPrix();
 }
 
 });
@@ -1931,7 +2127,23 @@ document.querySelector("form").submit();
             <span class="mdr-val" id="modalPassager"></span>
         </div>
 
-       <div class="modal-fee-note"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:inline-block;vertical-align:middle;"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> Des frais de service de <strong>500 FCFA</strong> seront ajoutés au total.</div>
+        <div class="modal-detail-row">
+           <span class="mdr-icon">💰</span>
+            <span class="mdr-label">Prix du billet</span>
+            <span class="mdr-val" id="modalPrixBillet"></span>
+        </div>
+
+        <div class="modal-detail-row">
+           <span class="mdr-icon">➕</span>
+            <span class="mdr-label">Frais de service</span>
+            <span class="mdr-val" id="modalFrais"></span>
+        </div>
+
+        <div class="modal-detail-row" style="font-weight:700; border-top:1px solid rgba(0,0,0,.12); margin-top:6px; padding-top:10px;">
+           <span class="mdr-icon">💳</span>
+            <span class="mdr-label">Total à payer</span>
+            <span class="mdr-val" id="modalTotal"></span>
+        </div>
 
         <div class="modal-btns">
 
