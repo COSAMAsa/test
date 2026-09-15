@@ -43,6 +43,18 @@ if(!$traversee){
 }
 
 // Sénégal
+// 🆕 Libellé dynamique du champ "Carabane" selon le sens du voyage
+// Dakar -> Ziguinchor : Carabane est une étape d'ARRIVÉE
+// Ziguinchor -> Dakar : Carabane est une étape de DÉPART
+$depart_norm = strtolower(trim($traversee['depart']));
+$destination_norm = strtolower(trim($traversee['destination']));
+
+if(strpos($depart_norm, 'dakar') !== false && strpos($destination_norm, 'ziguinchor') !== false){
+    $label_depart_client = "Lieu d'arrivée (optionnel)";
+} else {
+    $label_depart_client = "Lieu de départ (optionnel)";
+}
+
 date_default_timezone_set('Africa/Dakar');
 
 $date_actuelle = date('Y-m-d H:i:s');
@@ -1616,7 +1628,7 @@ required>
 </div>
 
 <div class="field-group">
-<label for="f_depart_client">Lieu de départ (optionnel)</label>
+<label for="f_depart_client"><?= htmlspecialchars($label_depart_client) ?></label>
 <select
 class="form-select"
 name="depart_client"
